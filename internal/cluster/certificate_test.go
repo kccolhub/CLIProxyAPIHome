@@ -145,6 +145,70 @@ func TestClusterTLSRejectsDeletedClientCertificate(t *testing.T) {
 	}
 }
 
+func TestSignClientCertificateRequestAllowsStatelessReenrollment(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db, errOpen := OpenSQLite(ctx, filepath.Join(t.TempDir(), "home.db"))
+	if errOpen != nil {
+		t.Fatalf("OpenSQLite() error = %v", errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("DB() error = %v", errDB)
+	}
+	t.Cleanup(func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sqlite db: %v", errClose)
+		}
+	})
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+	repo := NewRepository(db)
+	if _, errEnsure := repo.EnsureClusterCertificates(ctx, "127.0.0.1"); errEnsure != nil {
+		t.Fatalf("EnsureClusterCertificates() error = %v", errEnsure)
+	}
+
+	certificateID, enrollmentSecret, errPending := repo.CreatePendingClientCertificate(ctx)
+	if errPending != nil {
+		t.Fatalf("CreatePendingClientCertificate() error = %v", errPending)
+	}
+	_, firstCSR := createClientCSR(t, certificateID)
+	firstCert, _, errFirst := repo.SignClientCertificateRequest(ctx, certificateID, enrollmentSecret, firstCSR)
+	if errFirst != nil {
+		t.Fatalf("first SignClientCertificateRequest() error = %v", errFirst)
+	}
+	firstFingerprint, errFirstFingerprint := certificateFingerprintPEM(firstCert)
+	if errFirstFingerprint != nil {
+		t.Fatalf("first certificate fingerprint error = %v", errFirstFingerprint)
+	}
+
+	// A fresh Pod has a fresh key and must be able to replace the old client certificate.
+	_, secondCSR := createClientCSR(t, certificateID)
+	secondCert, _, errSecond := repo.SignClientCertificateRequest(ctx, certificateID, enrollmentSecret, secondCSR)
+	if errSecond != nil {
+		t.Fatalf("stateless reenrollment error = %v", errSecond)
+	}
+	if string(firstCert) == string(secondCert) {
+		t.Fatal("stateless reenrollment returned the original certificate")
+	}
+	secondFingerprint, errSecondFingerprint := certificateFingerprintPEM(secondCert)
+	if errSecondFingerprint != nil {
+		t.Fatalf("second certificate fingerprint error = %v", errSecondFingerprint)
+	}
+	if active, errActive := repo.ClientCertificateFingerprintActive(ctx, certificateID, firstFingerprint); errActive != nil || active {
+		t.Fatalf("old client certificate active = %v, %v; want revoked", active, errActive)
+	}
+	if active, errActive := repo.ClientCertificateFingerprintActive(ctx, certificateID, secondFingerprint); errActive != nil || !active {
+		t.Fatalf("new client certificate active = %v, %v; want active", active, errActive)
+	}
+
+	if _, _, errInvalid := repo.SignClientCertificateRequest(ctx, certificateID, enrollmentSecret+"-invalid", secondCSR); errInvalid == nil {
+		t.Fatal("invalid enrollment secret unexpectedly re-enrolled the client certificate")
+	}
+}
+
 func createClientCSR(t *testing.T, commonName string) (*rsa.PrivateKey, []byte) {
 	t.Helper()
 	key, errKey := rsa.GenerateKey(rand.Reader, certificateKeyBits)

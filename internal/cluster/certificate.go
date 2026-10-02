@@ -213,7 +213,12 @@ func (r *Repository) CreateHomeJWT(ctx context.Context, certificateID string, ip
 	return signHomeJWT(key, claims)
 }
 
-// SignClientCertificateRequest signs a client CSR exactly once and returns the client certificate plus CA.
+// SignClientCertificateRequest signs a client CSR and returns the client certificate plus CA.
+//
+// The enrollment secret remains valid after the first issuance so a stateless
+// CPA container can re-enroll after its local mTLS files are lost (for example,
+// when Kubernetes replaces the Pod). Issuing a replacement certificate updates
+// the stored fingerprint, which revokes the previous certificate immediately.
 func (r *Repository) SignClientCertificateRequest(ctx context.Context, certificateID string, enrollmentSecret string, csrPEM []byte) ([]byte, []byte, error) {
 	db, errDB := r.database()
 	if errDB != nil {
@@ -260,11 +265,11 @@ func (r *Repository) SignClientCertificateRequest(ctx context.Context, certifica
 		if errFirst != nil {
 			return errFirst
 		}
-		if strings.TrimSpace(record.CertificatePEM) != "" {
-			return fmt.Errorf("certificate id has already been issued")
-		}
 		if record.IsCA || record.IsServer {
 			return fmt.Errorf("certificate id is not a pending client certificate")
+		}
+		if strings.TrimSpace(record.CertificatePEM) != "" && strings.TrimSpace(record.EnrollmentSecretHash) == "" {
+			return fmt.Errorf("certificate id has already been issued")
 		}
 		if !verifyEnrollmentSecret(record.EnrollmentSecretHash, enrollmentSecret) {
 			return fmt.Errorf("enrollment secret is invalid")
@@ -296,7 +301,6 @@ func (r *Repository) SignClientCertificateRequest(ctx context.Context, certifica
 		record.CertificateFingerprint = certificateFingerprintDER(der)
 		record.CSRPEM = string(csrPEM)
 		record.PrivateKeyPEM = ""
-		record.EnrollmentSecretHash = ""
 		record.IsClient = true
 		record.IsCA = false
 		record.IsServer = false
