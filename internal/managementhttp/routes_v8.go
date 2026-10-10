@@ -67,6 +67,9 @@ func managementV8Routes(legacy *RouteRegistry, sdk *cpasdkapi.Handler, home *clu
 		routes.Set(http.MethodGet, "/observability/logs", home.GetLogsV8)
 		routes.Set(http.MethodGet, "/credentials", home.ListCredentialsV8)
 		routes.Set(http.MethodGet, "/credentials/models", home.GetCredentialModelsV8)
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+			routes.Set(method, "/nodes/:node_id/plugin-panel/*path", home.ProxyNodePluginPanel)
+		}
 		routes.Set(http.MethodGet, "/oauth/auth-url", home.StartOAuthV8)
 		routes.Set(http.MethodPost, "/oauth/import", home.ImportOAuthV8)
 		routes.Set(http.MethodDelete, "/oauth/session", home.CancelAuthSession)

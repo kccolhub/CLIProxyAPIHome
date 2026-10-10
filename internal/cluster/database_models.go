@@ -425,6 +425,7 @@ var homeDatabaseModels = currentDatabaseModels()
 var databaseMigrationOnlyModels = []databaseModel{
 	// Session bindings are expiring runtime state, not portable snapshot data.
 	newDatabaseModel[SessionAffinityRecord]("session_affinity", []string{"key"}, false, false),
+	newDatabaseModel[PluginPanelRecord]("node_plugin_panel", []string{"node_id"}, false, false),
 	newDatabaseModel[schemaMigrationRecord]("home_schema_migration", []string{"id"}, false, false),
 	newDatabaseModel[ClusterMasterGateRecord]("cluster_master_gate", []string{"id"}, false, false),
 	newDatabaseModel[ClusterRebalanceGateRecord]("cluster_rebalance_gate", []string{"id"}, false, false),
