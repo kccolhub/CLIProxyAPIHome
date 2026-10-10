@@ -302,6 +302,8 @@ func run() int {
 		return current, errConfig
 	})
 	rt.SetPluginSyncNodeActive(repo.ClientCertificateFingerprintActive)
+	rt.SetPluginPanelRegister(repo.RegisterPluginPanel)
+	rt.SetPluginAuthRead(repo.ReadPluginAuth)
 
 	clusterClientAddr, errClusterClientAddr := resolveDatabaseNodeIP(runCtx, clusterDB, dbBackend, clusterCfg, clusterExists)
 	if errClusterClientAddr != nil {

@@ -258,15 +258,23 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	if parentSessionID != "" && strings.TrimSpace(headers.Get("X-Parent-Session-ID")) == "" {
 		headers.Set("X-Parent-Session-ID", parentSessionID)
 	}
-	authRes, authErr := env.Runtime.Authenticate(ctx, headers)
-	if authErr != nil {
-		reply := dispatch.BulkString([]byte(buildAuthErrorJSON(authErr)))
-		return nil, "", &reply
-	}
-
 	userAPIKey := ""
-	if authRes != nil {
-		userAPIKey = authRes.Principal
+	pluginID := strings.TrimSpace(gjson.Get(jsonArg, "plugin_id").String())
+	if pluginID != "" {
+		active, errActive := env.Runtime.PluginSyncNodeActive(ctx, env.NodeID, env.ClientCertificateFingerprint)
+		if errActive != nil || !active || !env.ConnectionLifetime.Controlled || !env.Runtime.PluginEnabled(ctx, pluginID) || pinnedAuthID == "" {
+			reply := dispatch.BulkString([]byte(buildErrorJSON("unauthorized plugin dispatch")))
+			return nil, "", &reply
+		}
+	} else {
+		authRes, authErr := env.Runtime.Authenticate(ctx, headers)
+		if authErr != nil {
+			reply := dispatch.BulkString([]byte(buildAuthErrorJSON(authErr)))
+			return nil, "", &reply
+		}
+		if authRes != nil {
+			userAPIKey = authRes.Principal
+		}
 	}
 
 	// Older CPA nodes use count as the Home-side retry limit. Keep that
@@ -277,7 +285,13 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	}
 
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
-	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, excludedAuthIDs, pinnedAuthID, home.DispatchConcurrencyContext{
+	dispatchFn := env.Runtime.DispatchForAPIKeyWithConcurrency
+	dispatchIdentity := userAPIKey
+	if pluginID != "" {
+		dispatchFn = env.Runtime.DispatchForPluginWithConcurrency
+		dispatchIdentity = pluginID
+	}
+	result, errDispatch := dispatchFn(ctx, model, headers, dispatchIdentity, credentialPolicy, excludedAuthIDs, pinnedAuthID, home.DispatchConcurrencyContext{
 		Fingerprint:       env.ConnectionLifetime.Fingerprint,
 		ConnectedAt:       env.ConnectionLifetime.ConnectedAt,
 		Controlled:        env.ConnectionLifetime.Controlled,

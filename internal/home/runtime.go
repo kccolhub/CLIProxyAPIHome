@@ -53,6 +53,8 @@ type Runtime struct {
 	pluginStoreAuthResolver func(context.Context) ([]pluginstore.ResolvedAuthConfig, error)
 	pluginSyncConfigLoader  func(context.Context) (*config.Config, error)
 	pluginSyncNodeActive    func(context.Context, string, string) (bool, error)
+	pluginPanelRegister     func(context.Context, node.PluginPanelEndpoint) error
+	pluginAuthRead          func(context.Context, string, string) ([]byte, error)
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
 	clusterAdapter          ClusterAdapter
 	concurrencyAdmitter     ConcurrencyAdmitter

@@ -277,6 +277,7 @@ var databaseSnapshotV5Models = databaseSnapshotV5ModelRegistry()
 var homeDatabaseModels = currentDatabaseModels()
 
 var databaseMigrationOnlyModels = []databaseModel{
+	newDatabaseModel[PluginPanelRecord]("node_plugin_panel", []string{"node_id"}, false, false),
 	newDatabaseModel[schemaMigrationRecord]("home_schema_migration", []string{"id"}, false, false),
 	newDatabaseModel[ClusterMasterGateRecord]("cluster_master_gate", []string{"id"}, false, false),
 	newDatabaseModel[ManagementInFlightSnapshotCursorRecord]("management_in_flight_snapshot_cursors", []string{"cursor"}, false, false),

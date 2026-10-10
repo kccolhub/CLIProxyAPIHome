@@ -2,6 +2,12 @@
 
 This document describes the current DB-backed Management API exposed by CLIProxyAPIHome. Home startup initializes a runtime database and registers the database-backed management route set used by the Home runtime.
 
+## CPA node plugin panels
+
+`GET /v8/management/nodes/:node_id/plugin-panel/plugins` returns the plugins actually loaded on an online CPA node, including `id`, `name`, `version` and `menus` (`path`, `menu`, `description`). `GET|HEAD|POST|PUT|PATCH|DELETE /v8/management/nodes/:node_id/plugin-panel/*path` forwards plugin resource and plugin-owned management requests to that node. Normal Home management authentication is required. The target is derived from the authenticated node registration and current topology; clients cannot supply a target host or port. Unregistered/old nodes and offline nodes return 409; unreachable nodes return 502. Full standalone CPA management routes remain disabled.
+
+CPA registers its plugin HTTP bridge through RESP/mTLS. Registration secrets are separate from the Home management key and excluded from exports and public responses. Plugins use the Home DB credential inventory through host callbacks. Internal model callbacks identify the calling plugin over the controlled node connection, require an enabled plugin and pinned credential, and retain normal credential concurrency admission/accounting. Public inference requests still require their usual API key. Older CPA nodes continue to operate but need upgrading to expose panels.
+
 Base URL:
 
 ```text

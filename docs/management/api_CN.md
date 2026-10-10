@@ -2,6 +2,12 @@
 
 本文档描述 CLIProxyAPIHome 当前 DB-backed Management API。Home 启动时会初始化 runtime database，并注册 Home runtime 使用的 database-backed management route set。
 
+## CPA 节点插件面板
+
+`GET /v8/management/nodes/:node_id/plugin-panel/plugins` 返回在线 CPA 节点实际加载的插件，包括 `id`、`name`、`version` 和 `menus`（`path`、`menu`、`description`）。`GET|HEAD|POST|PUT|PATCH|DELETE /v8/management/nodes/:node_id/plugin-panel/*path` 将插件资源和插件拥有的管理请求转发到该节点，沿用 Home 管理鉴权。目标地址来自通过身份校验的节点注册及当前拓扑，客户端不能指定目标主机或端口。未注册面板的旧节点、离线节点返回 409，节点无法连接返回 502。CPA 独立管理后台仍保持关闭。
+
+CPA 通过 RESP/mTLS 注册插件 HTTP 通道；通道凭证独立于 Home 管理密钥，不进入导出和公共响应。插件通过 host 回调读取 Home 数据库的凭证列表；内部模型回调在受控节点连接上传递调用插件身份，要求插件已启用并指定凭证，仍执行正常的凭证并发准入和计数。公共推理请求继续使用原有 API key 鉴权。旧版 CPA 可以继续工作，升级后才提供节点插件面板。
+
 基础路径：
 
 ```text
