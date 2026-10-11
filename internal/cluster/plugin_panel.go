@@ -12,6 +12,7 @@ import (
 type PluginPanelRecord struct {
 	NodeID    string `gorm:"primaryKey;size:255"`
 	IP        string
+	Address   string
 	Port      int
 	Token     string
 	UpdatedAt time.Time
@@ -24,8 +25,8 @@ func (r *Repository) RegisterPluginPanel(ctx context.Context, endpoint node.Plug
 	if errDB != nil {
 		return errDB
 	}
-	record := PluginPanelRecord{NodeID: endpoint.NodeID, IP: endpoint.IP, Port: endpoint.Port, Token: endpoint.Token, UpdatedAt: time.Now().UTC()}
-	return db.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "node_id"}}, DoUpdates: clause.AssignmentColumns([]string{"ip", "port", "token", "updated_at"})}).Create(&record).Error
+	record := PluginPanelRecord{NodeID: endpoint.NodeID, IP: endpoint.IP, Address: endpoint.Address, Port: endpoint.Port, Token: endpoint.Token, UpdatedAt: time.Now().UTC()}
+	return db.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "node_id"}}, DoUpdates: clause.AssignmentColumns([]string{"ip", "address", "port", "token", "updated_at"})}).Create(&record).Error
 }
 
 func (r *Repository) GetPluginPanel(ctx context.Context, nodeID string) (PluginPanelRecord, error) {
