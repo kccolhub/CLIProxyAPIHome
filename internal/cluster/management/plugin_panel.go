@@ -1,6 +1,7 @@
 package management
 
 import (
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // ProxyNodePluginPanel exposes only plugin-owned routes on a live CPA node.
@@ -30,7 +32,11 @@ func (h *Handler) ProxyNodePluginPanel(c *gin.Context) {
 	}
 	endpoint, errEndpoint := h.repo.GetPluginPanel(c.Request.Context(), nodeID)
 	if errEndpoint != nil {
-		c.JSON(409, gin.H{"error": "节点尚未注册插件面板，请升级 CPA 节点"})
+		if errors.Is(errEndpoint, gorm.ErrRecordNotFound) {
+			c.JSON(409, gin.H{"error": "节点尚未注册插件面板，请升级 CPA 节点"})
+		} else {
+			c.JSON(503, gin.H{"error": "节点插件面板存储不可用，请检查 Home 数据库迁移"})
+		}
 		return
 	}
 	live := false
@@ -44,7 +50,15 @@ func (h *Handler) ProxyNodePluginPanel(c *gin.Context) {
 		c.JSON(409, gin.H{"error": "节点当前不在线"})
 		return
 	}
-	target := &url.URL{Scheme: "http", Host: net.JoinHostPort(endpoint.IP, strconv.Itoa(endpoint.Port))}
+	address := endpoint.IP
+	if endpoint.Address != "" {
+		address = endpoint.Address
+	}
+	if net.ParseIP(address) == nil {
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+		return
+	}
+	target := &url.URL{Scheme: "http", Host: net.JoinHostPort(address, strconv.Itoa(endpoint.Port))}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Director = func(request *http.Request) {
 		request.URL.Scheme, request.URL.Host = target.Scheme, target.Host

@@ -8,6 +8,8 @@ This document describes the current DB-backed Management API exposed by CLIProxy
 
 CPA registers its plugin HTTP bridge through RESP/mTLS. Registration secrets are separate from the Home management key and excluded from exports and public responses. Plugins use the Home DB credential inventory through host callbacks. Internal model callbacks identify the calling plugin over the controlled node connection, require an enabled plugin and pinned credential, and retain normal credential concurrency admission/accounting. Public inference requests still require their usual API key. Older CPA nodes continue to operate but need upgrading to expose panels.
 
+The bridge requires HTTP reachability from Home to CPA. Nodes advertise their private connection address to support cluster SNAT; Home retains the server-observed peer address for topology checks. Database schema v7 adds ephemeral registrations and remains compatible with v6 exports.
+
 Base URL:
 
 ```text

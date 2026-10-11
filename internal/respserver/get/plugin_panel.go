@@ -25,6 +25,13 @@ func handlePluginPanel(ctx context.Context, env dispatch.Env, args []string) dis
 		return dispatch.Err("invalid plugin panel endpoint")
 	}
 	endpoint.NodeID, endpoint.IP = env.NodeID, env.ClientIP
+	if endpoint.Address != "" {
+		address := net.ParseIP(endpoint.Address)
+		peer := net.ParseIP(env.ClientIP)
+		if address == nil || !(address.Equal(peer) || address.IsPrivate() || (address.IsLoopback() && peer.IsLoopback())) {
+			return dispatch.Err("invalid plugin panel address")
+		}
+	}
 	if errRegister := env.Runtime.RegisterPluginPanel(ctx, endpoint); errRegister != nil {
 		return dispatch.Err("plugin panel registration failed")
 	}
