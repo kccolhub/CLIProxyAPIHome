@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
@@ -106,11 +107,12 @@ type Manager struct {
 	store    Store
 	selector Selector
 
-	mu          sync.RWMutex
-	updateLocks authUpdateLocks
-	auths       map[string]*Auth
-	indexAuth   map[string]*Auth
-	scheduler   *authScheduler
+	mu              sync.RWMutex
+	updateLocks     authUpdateLocks
+	auths           map[string]*Auth
+	indexAuth       map[string]*Auth
+	scheduler       *authScheduler
+	modelAliasHints modelAliasHintIndex
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -362,6 +364,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	delete(m.auths, id)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(id, nil)
 
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
@@ -486,6 +489,10 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 		persisted = nil
 	}
 	m.mu.RUnlock()
+	// Local runtime state from a projection is not a complete credential.
+	if persisted != nil && persisted.RuntimeProjection {
+		return nil
+	}
 	accepted, errPersist := m.persistLocked(ctx, persisted, true)
 	if errPersist != nil || accepted {
 		return errPersist
@@ -526,6 +533,10 @@ func (m *Manager) persistQueued(ctx context.Context, auth *Auth) error {
 	m.mu.RUnlock()
 	unlockUpdate()
 
+	// An index reload may replace a full auth after its result was queued.
+	if persisted != nil && persisted.RuntimeProjection {
+		return nil
+	}
 	accepted, errPersist := m.persistWithStore(ctx, store, persisted, true)
 	if errPersist != nil || accepted {
 		return errPersist
@@ -551,6 +562,9 @@ func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth,
 	}
 	if auth.Disabled {
 		// Keep disabled auth entries persisted to disk too, consistent with CPA.
+	}
+	if auth.RuntimeProjection {
+		return false, ErrRuntimeProjectionPersist
 	}
 	if auth.Metadata == nil && auth.Storage == nil {
 		return true, nil
@@ -676,6 +690,7 @@ func (m *Manager) removeAuthLocked(authID string) {
 	delete(m.auths, authID)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(authID, nil)
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(authID)
 	}
@@ -698,7 +713,9 @@ func (m *Manager) enqueueResultPersist(ctx context.Context, auth *Auth) {
 // stageResultPersist publishes the latest snapshot before scheduling database
 // work so configuration fencing can observe it without racing the worker.
 func (m *Manager) stageResultPersist(ctx context.Context, auth *Auth) (string, bool) {
-	if m == nil || m.store == nil || auth == nil {
+	// Projection metadata is scheduling input, not permission to save a full
+	// record. Shared transitions still use StateMutator on authoritative rows.
+	if m == nil || m.store == nil || auth == nil || auth.RuntimeProjection {
 		return "", false
 	}
 	if shouldSkipPersist(ctx) {
@@ -1214,13 +1231,20 @@ func classifyDispatchAvailability(auth *Auth, blockedModel string, blocked bool,
 	return false, reason, next
 }
 
-func dispatchAvailabilityForModel(auth *Auth, resolvedModel, routeModel string, now time.Time) (bool, blockReason, time.Time) {
+// dispatchModelBlockStatus preserves the upstream-first check and legacy route fallback.
+// Returning the checked model lets diagnostics identify the state that blocks dispatch.
+func dispatchModelBlockStatus(auth *Auth, resolvedModel, routeModel string, now time.Time) (string, bool, blockReason, time.Time) {
 	blockedModel := resolvedModel
 	blocked, reason, next := isAuthBlockedForModel(auth, blockedModel, now)
 	if !blocked && resolvedModel != canonicalModelKey(routeModel) {
 		blockedModel = routeModel
 		blocked, reason, next = isAuthBlockedForModel(auth, blockedModel, now)
 	}
+	return blockedModel, blocked, reason, next
+}
+
+func dispatchAvailabilityForModel(auth *Auth, resolvedModel, routeModel string, now time.Time) (bool, blockReason, time.Time) {
+	blockedModel, blocked, reason, next := dispatchModelBlockStatus(auth, resolvedModel, routeModel, now)
 	return classifyDispatchAvailability(auth, blockedModel, blocked, reason, next, now)
 }
 
@@ -1454,6 +1478,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
 		}
 
+		if opts.SessionAffinity != nil {
+			*opts.SessionAffinity = SessionAffinitySelection{}
+		}
 		var auth *Auth
 		if pluginScheduler != nil {
 			pluginAuth, handled, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths)
@@ -1827,7 +1854,17 @@ func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Erro
 	if auth == nil || errRefresh == nil {
 		return nil
 	}
-	if isTerminalRefreshAuthError(errRefresh) {
+	unknownOutcome := false
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		codexauth.RecordRefreshOutcomeUnknown(auth.Metadata, errRefresh)
+		var authErr *Error
+		unknownOutcome = codexauth.IsRefreshOutcomeUnknown(errRefresh) ||
+			(errors.As(errRefresh, &authErr) && authErr.Code == ErrorCodeRefreshOutcomeUnknown)
+	}
+	if !unknownOutcome && isTerminalRefreshAuthError(errRefresh) {
 		refreshFailure := newUnauthorizedRefreshErrorFrom(errRefresh)
 		disableAuthAfterUnauthorized(auth, nil, refreshFailure, now)
 		return refreshFailure
@@ -1843,6 +1880,12 @@ func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Erro
 		}
 	}
 	refreshFailure := newTransientRefreshErrorFrom(errRefresh)
+	if unknownOutcome {
+		refreshFailure.Code = ErrorCodeRefreshOutcomeUnknown
+		refreshFailure.Message = "credential refresh outcome unknown; replace the refresh credentials before retrying"
+		refreshFailure.Retryable = false
+		refreshFailure.Upstream = nil
+	}
 	if refreshFailure.Diagnostic != "" && !strings.Contains(refreshFailure.Diagnostic, "retry_at=") {
 		refreshFailure.Diagnostic = logging.SafeDiagnosticForLog(refreshFailure.Diagnostic + " retry_at=" + retryAt.UTC().Format(time.RFC3339Nano))
 	}
@@ -2177,6 +2220,9 @@ func copyUpstreamResponse(target *Error, errRefresh error) bool {
 // proxies and provider edges can return them for transient failures.
 func isTerminalRefreshAuthError(errRefresh error) bool {
 	if errRefresh == nil || errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+		return false
+	}
+	if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 		return false
 	}
 	var authErr *Error
@@ -2677,18 +2723,24 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
 	now = time.Now().UTC()
 	if errRefresh != nil {
-		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
+		if (errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil) && !codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 			return nil, errRefresh
 		}
 		snapshot := target.Clone()
 		refreshFailure := ApplyRefreshFailureState(snapshot, errRefresh, now)
 		logCredentialRefreshFailure(ctx, snapshot, refreshFailure)
-		updatedPersisted, errUpdate := m.Update(ctx, snapshot)
+		persistCtx := ctx
+		if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
+			var cancelPersist context.CancelFunc
+			persistCtx, cancelPersist = withRefreshProviderTimeout(context.WithoutCancel(ctx))
+			defer cancelPersist()
+		}
+		updatedPersisted, errUpdate := m.Update(persistCtx, snapshot)
 		if errUpdate != nil {
 			return nil, errUpdate
 		}
@@ -2794,12 +2846,12 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
 	now := time.Now().UTC()
 	if errRefresh != nil {
-		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
+		if (errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil) && !codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 			return target.Clone(), errRefresh
 		}
 		snapshot := target.Clone()
@@ -2971,7 +3023,7 @@ func isRefreshAcquisitionError(authErr *Error) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
-	case refreshTransientErrorCode, refreshUnsupportedCode:
+	case refreshTransientErrorCode, refreshUnsupportedCode, ErrorCodeRefreshOutcomeUnknown:
 		return true
 	default:
 		return false

@@ -86,6 +86,16 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 	return requestedModel
 }
 
+// ResolveExecutionModel returns the auth-specific upstream model that dispatch
+// would send for a public route model, or the trimmed route model when no
+// alias applies.
+func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
+	if resolved := strings.TrimSpace(m.resolveDispatchModel(auth, routeModel).Model); resolved != "" {
+		return resolved
+	}
+	return strings.TrimSpace(routeModel)
+}
+
 // resolveDispatchModel resolves the auth-specific upstream model used for execution and runtime state.
 func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchModelResolution {
 	requestedModel := rewriteModelForAuth(routeModel, auth)
@@ -146,6 +156,10 @@ func resolveUpstreamModelFromAuthConfigModels(auth *Auth, requestedModel string)
 
 // modelAliasEntriesFromMetadata converts Home model metadata into alias entries.
 func modelAliasEntriesFromMetadata(raw any) []modelAliasEntry {
+	// Publication can reuse decoded aliases without changing stored metadata.
+	if entries, ok := raw.([]modelAliasEntry); ok {
+		return entries
+	}
 	if raw == nil {
 		return nil
 	}

@@ -594,6 +594,149 @@ func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {
 	}
 }
 
+func TestApplyOAuthFieldPatchRejectsInvalidExcludedModelsAtomically(t *testing.T) {
+	for _, key := range []string{"excluded_models", "excluded-models"} {
+		for _, tc := range []struct {
+			name   string
+			suffix string
+			value  string
+		}{
+			{name: "number", value: `123`},
+			{name: "string", value: `"claude-new"`},
+			{name: "boolean", value: `true`},
+			{name: "object", value: `{}`},
+			{name: "mixed array", value: `["claude-new",123]`},
+			{name: "null entry", value: `["claude-new",null]`},
+			{name: "boolean entry", value: `[false]`},
+			{name: "object entry", value: `[{}]`},
+			{name: "nested array", value: `[["claude-new"]]`},
+			{name: "child path", suffix: ".child", value: `["claude-new"]`},
+			{name: "null child path", suffix: ".child", value: `null`},
+			{name: "index path", suffix: ".0", value: `"claude-new"`},
+		} {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				auth := &coreauth.Auth{
+					ID:       "claude-auth",
+					Provider: "claude",
+					Attributes: map[string]string{
+						"auth_kind":            "oauth",
+						"excluded_models":      "claude-old",
+						"excluded_models_hash": "old-hash",
+					},
+					Metadata: map[string]any{
+						"type":            "claude",
+						"excluded_models": []string{"claude-old"},
+						"excluded-models": []string{"claude-legacy"},
+					},
+				}
+				before, errMarshal := json.Marshal(auth)
+				if errMarshal != nil {
+					t.Fatalf("marshal auth before patch: %v", errMarshal)
+				}
+				fields := map[string]json.RawMessage{
+					"abc":           json.RawMessage(`true`),
+					key + tc.suffix: json.RawMessage(tc.value),
+				}
+				changed, errPatch := applyOAuthFieldPatch(auth, fields)
+				if errPatch == nil || changed {
+					t.Fatalf("applyOAuthFieldPatch() = (%t, %v), want unchanged validation error", changed, errPatch)
+				}
+				after, errMarshalAfter := json.Marshal(auth)
+				if errMarshalAfter != nil {
+					t.Fatalf("marshal auth after patch: %v", errMarshalAfter)
+				}
+				if string(after) != string(before) {
+					t.Fatalf("auth changed after rejected patch: before=%s after=%s", before, after)
+				}
+			})
+		}
+	}
+}
+
+func TestPatchAuthFileFieldsRejectsInvalidExcludedModels(t *testing.T) {
+	handler, engine, _, closeRepo := newConcurrencyManagementTestServer(t)
+	defer closeRepo()
+	seedOAuthAuth(t, handler.repo, "oauth-exclusions")
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{"id":"oauth-exclusions","excluded_models":["codex-old"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("initial PATCH status = %d body=%s", response.Code, response.Body.String())
+	}
+	_, before, errAuth := handler.repo.GetAuth(t.Context(), "oauth-exclusions")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() before rejected patch: %v", errAuth)
+	}
+
+	for _, patch := range []string{
+		`{"id":"oauth-exclusions","abc":true,"excluded_models":123}`,
+		`{"id":"oauth-exclusions","abc":true,"excluded-models":"codex-new"}`,
+		`{"id":"oauth-exclusions","abc":true,"excluded_models":["codex-new",null]}`,
+		`{"id":"oauth-exclusions","abc":true,"excluded-models.child":null}`,
+	} {
+		response = httptest.NewRecorder()
+		request = httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(patch))
+		request.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH %s status = %d body=%s, want 400", patch, response.Code, response.Body.String())
+		}
+		_, after, errAuthAfter := handler.repo.GetAuth(t.Context(), "oauth-exclusions")
+		if errAuthAfter != nil {
+			t.Fatalf("GetAuth() after rejected patch: %v", errAuthAfter)
+		}
+		if string(after.AuthJSON) != string(before.AuthJSON) || after.Version != before.Version {
+			t.Fatalf("persisted auth changed after rejected patch %s", patch)
+		}
+	}
+}
+
+func TestApplyOAuthFieldPatchSyncsExcludedModelsAttribute(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:         "claude-auth",
+		Provider:   "claude",
+		Attributes: map[string]string{"auth_kind": "oauth"},
+		Metadata:   map[string]any{"type": "claude"},
+	}
+	assertCleared := func(stage string) {
+		t.Helper()
+		if _, ok := auth.Attributes["excluded_models"]; ok {
+			t.Fatalf("%s: attributes.excluded_models = %q, want removed", stage, auth.Attributes["excluded_models"])
+		}
+		if _, ok := auth.Attributes["excluded_models_hash"]; ok {
+			t.Fatalf("%s: attributes.excluded_models_hash = %q, want removed", stage, auth.Attributes["excluded_models_hash"])
+		}
+	}
+
+	// Legacy key, mixed case and duplicates must normalize; global exclusions are never merged in.
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded-models":["Claude-B","claude-a","claude-b"]}`)); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() error = %v", errPatch)
+	}
+	if got, want := auth.Attributes["excluded_models"], "claude-a,claude-b"; got != want {
+		t.Fatalf("attributes.excluded_models = %q, want %q", got, want)
+	}
+	if auth.Attributes["excluded_models_hash"] == "" {
+		t.Fatalf("attributes.excluded_models_hash is empty")
+	}
+
+	// An empty list clears the per-account override so the credential inherits global exclusions.
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded_models":[]}`)); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() clear error = %v", errPatch)
+	}
+	assertCleared("empty list")
+
+	// null behaves the same as an empty list.
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded_models":["claude-c"]}`)); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() set error = %v", errPatch)
+	}
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded_models":null}`)); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() null error = %v", errPatch)
+	}
+	assertCleared("null")
+}
+
 func mustRawFields(t *testing.T, payload string) map[string]json.RawMessage {
 	t.Helper()
 	var fields map[string]json.RawMessage

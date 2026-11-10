@@ -24,6 +24,7 @@ func managementV8Routes(legacy *RouteRegistry, sdk *cpasdkapi.Handler, home *clu
 		"/usage-queue":                "/observability/usage/queue",
 		"/auth-files":                 "/credentials",
 		"/auth-files/models":          "/credentials/models",
+		"/auth-files/model-states":    "/credentials/model-states",
 		"/auth-files/download":        "/credentials/download",
 		"/auth-files/status":          "/credentials/status",
 		"/auth-files/fields":          "/credentials/fields",
@@ -63,6 +64,9 @@ func managementV8Routes(legacy *RouteRegistry, sdk *cpasdkapi.Handler, home *clu
 		routes.Set(method, "/config/*path", configHandler)
 	}
 	if home != nil {
+		routes.Set(http.MethodGet, "/observability/logs", home.GetLogsV8)
+		routes.Set(http.MethodGet, "/credentials", home.ListCredentialsV8)
+		routes.Set(http.MethodGet, "/credentials/models", home.GetCredentialModelsV8)
 		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
 			routes.Set(method, "/nodes/:node_id/plugin-panel/*path", home.ProxyNodePluginPanel)
 		}

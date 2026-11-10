@@ -258,6 +258,7 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	if parentSessionID != "" && strings.TrimSpace(headers.Get("X-Parent-Session-ID")) == "" {
 		headers.Set("X-Parent-Session-ID", parentSessionID)
 	}
+	ctx = cluster.WithAPIKeyRequestCache(ctx)
 	userAPIKey := ""
 	pluginID := strings.TrimSpace(gjson.Get(jsonArg, "plugin_id").String())
 	if pluginID != "" {

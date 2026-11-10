@@ -23,6 +23,20 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+func (m *Manager) withCodexRefreshJournal(ctx context.Context) context.Context {
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if provider, ok := store.(interface {
+		CodexRefreshJournal() codexauth.RefreshJournal
+	}); ok {
+		if journal := provider.CodexRefreshJournal(); journal != nil {
+			return codexauth.WithRefreshJournal(ctx, journal)
+		}
+	}
+	return ctx
+}
+
 // refreshCredential refreshes auth metadata when a refresh token or Meta DCA token is present.
 // It is best-effort: providers that do not support refresh are treated as no-op.
 func refreshCredential(ctx context.Context, cfg *config.Config, auth *Auth, rt http.RoundTripper) (*Auth, error) {
@@ -60,6 +74,11 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	if refreshToken == "" {
 		return auth, nil
 	}
+	if errOutcome := codexauth.RefreshOutcomeUnknown(auth.Metadata, false); errOutcome != nil {
+		if errPreserve := codexauth.PreserveRefreshOutcome(ctx, refreshToken, errOutcome); errPreserve != nil {
+			return nil, builtInRefreshError("codex", "provider_refresh", errPreserve)
+		}
+	}
 	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
@@ -67,6 +86,15 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
+	}
+	// Keep the model tier synchronized with refreshed subscription claims.
+	if claims, errParse := codexauth.ParseJWTToken(td.IDToken); errParse == nil && claims != nil {
+		if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+			if auth.Attributes == nil {
+				auth.Attributes = make(map[string]string)
+			}
+			auth.Attributes["plan_type"] = planType
+		}
 	}
 	auth.Metadata["id_token"] = td.IDToken
 	auth.Metadata["access_token"] = td.AccessToken

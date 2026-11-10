@@ -1,9 +1,38 @@
 package home
 
 import (
+	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+func TestSanitizeConfigYAMLForDownstreamPreservesModelCatalogs(t *testing.T) {
+	for name, version := range map[string]string{"legacy": "", "v8": "config-version: 8\n"} {
+		t.Run(name, func(t *testing.T) {
+			input := version + `models:
+  catalog: "https://example.com/models.json?revision=1&format=json"
+  codex-catalog: "http://localhost/codex.json"
+  devin-catalog: "/tmp/devin models.json"
+`
+			output, errSanitize := sanitizeConfigYAMLForDownstream([]byte(input))
+			if errSanitize != nil {
+				t.Fatal(errSanitize)
+			}
+			var original, downstream map[string]any
+			if errUnmarshal := yaml.Unmarshal([]byte(input), &original); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if errUnmarshal := yaml.Unmarshal(output, &downstream); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if !reflect.DeepEqual(downstream["models"], original["models"]) {
+				t.Fatalf("downstream models = %#v, want %#v", downstream["models"], original["models"])
+			}
+		})
+	}
+}
 
 // TestSanitizeConfigYAMLForDownstream_RemovesSensitiveKeys verifies test sanitize config yaml for downstream_ removes sensitive keys behavior.
 func TestSanitizeConfigYAMLForDownstream_RemovesSensitiveKeys(t *testing.T) {
@@ -130,5 +159,21 @@ func TestSanitizeConfigYAMLForDownstreamNullDocumentAppliesHomeModeScalars(t *te
 		if !strings.Contains(string(out), expected) {
 			t.Fatalf("downstream config = %q, want %q", out, expected)
 		}
+	}
+}
+
+// TestSanitizeConfigYAMLForDownstreamForwardsClaudeToolSearch verifies the v8
+// upstream.claude.tool-search switch reaches CPA in the flat layout it reads.
+func TestSanitizeConfigYAMLForDownstreamForwardsClaudeToolSearch(t *testing.T) {
+	out, errSanitize := sanitizeConfigYAMLForDownstream([]byte("config-version: 8\nupstream:\n  claude:\n    model-level-cooling: true\n    tool-search: true\n"))
+	if errSanitize != nil {
+		t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+	}
+	want := "claude:\n    model-level-cooling: true\n    tool-search: true\n"
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("downstream config = %q, want %q", out, want)
+	}
+	if strings.Contains(string(out), "upstream:") {
+		t.Fatalf("downstream config kept a v8 upstream block: %q", out)
 	}
 }

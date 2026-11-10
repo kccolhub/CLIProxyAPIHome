@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
@@ -57,14 +58,22 @@ type Runtime struct {
 	pluginAuthRead          func(context.Context, string, string) ([]byte, error)
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
 	clusterAdapter          ClusterAdapter
+	sessionAffinityStore    coreauth.SessionAffinityStore
 	concurrencyAdmitter     ConcurrencyAdmitter
 	clusterRefresh          func(context.Context, string, string) ([]byte, error)
 	originalStore           coreauth.Store
 
-	clusterUsageQueueMu sync.Mutex
-	clusterUsageQueue   *usagePayloadQueue
-
 	cancel context.CancelFunc
+
+	antigravityProbeMu        sync.Mutex
+	antigravityProbeWg        sync.WaitGroup
+	antigravityAccountProbes  map[string]map[*antigravityAccountProbe]struct{}
+	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
+	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+	antigravityPersistPending map[string]*antigravityHintPersistRequest
+	antigravityRefreshWake    chan struct{}
+	antigravityContext        context.Context
+	antigravityCancel         context.CancelFunc
 
 	fileWatcher interface{ Stop() error }
 }
@@ -122,6 +131,9 @@ type ConcurrencyAdmissionRequest struct {
 	ConnectedAt     time.Time
 	Controlled      bool
 	ProtocolVersion int
+	// SessionAffinity must be committed atomically with admission. On conflict,
+	// return coreauth.ErrSessionAffinityConflict without consuming a slot.
+	SessionAffinity *coreauth.SessionAffinityCommit
 }
 
 // ConcurrencyAdmissionResult describes the credential and model admitted by the limiter.
@@ -176,6 +188,10 @@ type clusterUsageStore interface {
 	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
 }
 
+type clusterUsageOutcomeStore interface {
+	StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
+}
+
 type appLogStore interface {
 	StoreAppLogPayload(ctx context.Context, clientIP string, payload string) error
 }
@@ -195,7 +211,6 @@ type kvStore interface {
 	KVIncrBy(ctx context.Context, key string, delta int64) (int64, error)
 	KVMGet(ctx context.Context, keys []string) ([]KVGetResult, error)
 	KVMSet(ctx context.Context, pairs map[string][]byte) error
-	KVPurgeExpired(ctx context.Context, now time.Time, limit int) (int64, error)
 }
 
 type pluginStatusStore interface {
@@ -219,6 +234,10 @@ type apiKeyModelScopedDispatchStore interface {
 	AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error)
 }
 
+type apiKeyModelAccessStore interface {
+	ModelAccessForAPIKey(ctx context.Context, apiKey string) (*coreauth.ModelAccess, error)
+}
+
 // NewRuntime creates a new runtime.
 func NewRuntime(cfg *config.Config) (*Runtime, error) {
 	// Keep validation before state changes so failures leave existing data intact.
@@ -239,7 +258,7 @@ func NewRuntime(cfg *config.Config) (*Runtime, error) {
 		dirSetter.SetBaseDir(cfg.AuthDir)
 	}
 
-	selector := selectorFromConfig(cfg)
+	selector := selectorFromConfig(cfg, nil)
 	coreManager := coreauth.NewManager(store, selector, nil)
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(cfg)
@@ -277,6 +296,14 @@ func (r *Runtime) SetClusterAdapter(adapter ClusterAdapter) {
 		return
 	}
 	r.clusterAdapter = adapter
+	r.sessionAffinityStore = nil
+	if adapter != nil && adapter.Enabled() {
+		if provider, ok := adapter.(interface {
+			SessionAffinityStore() coreauth.SessionAffinityStore
+		}); ok {
+			r.sessionAffinityStore = provider.SessionAffinityStore()
+		}
+	}
 	if admitter, ok := adapter.(ConcurrencyAdmitter); ok {
 		r.concurrencyAdmitter = admitter
 	} else {
@@ -293,6 +320,7 @@ func (r *Runtime) SetClusterAdapter(adapter ClusterAdapter) {
 			r.coreManager.SetFullAuthResolver(nil)
 			r.coreManager.SetStore(r.originalStore)
 		}
+		r.coreManager.SetSelector(selectorFromConfig(r.Config(), r.sessionAffinityStore))
 	}
 }
 
@@ -330,8 +358,12 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
-	r.startClusterUsageWriter(runCtx)
-	r.startKVCleanupLoop(runCtx)
+	r.cfgMu.Lock()
+	if r.antigravityCancel != nil {
+		r.antigravityCancel()
+	}
+	r.antigravityContext, r.antigravityCancel = runCtx, cancel
+	r.cfgMu.Unlock()
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -339,8 +371,9 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 		}
 	}
 
-	registry.StartModelsUpdater(runCtx)
-	registry.StartDevinModelsUpdater(runCtx)
+	registry.StartModelCatalogUpdaters(runCtx, r.Config().Models)
+	cpasdkauth.StartAntigravityVersionUpdater(runCtx)
+	go r.runAntigravityModelRefresh(runCtx)
 	r.registerModelRefreshCallback()
 	managementasset.SetCurrentConfig(r.cfg)
 	managementasset.StartAutoUpdater(context.Background(), configPath)
@@ -377,11 +410,20 @@ func (r *Runtime) Stop() {
 	if r == nil {
 		return
 	}
+	r.cfgMu.Lock()
+	antigravityCancel := r.antigravityCancel
+	r.antigravityCancel = nil
+	stoppedCtx, stopAntigravity := context.WithCancel(context.Background())
+	stopAntigravity()
+	r.antigravityContext = stoppedCtx
+	r.cfgMu.Unlock()
+	if antigravityCancel != nil {
+		antigravityCancel()
+	}
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
 	}
-	r.stopClusterUsageWriter()
 	if r.fileWatcher != nil {
 		_ = r.fileWatcher.Stop()
 		r.fileWatcher = nil
@@ -390,6 +432,8 @@ func (r *Runtime) Stop() {
 		r.pluginHost.ShutdownAll()
 	}
 	r.StopAutoRefresh()
+	r.cancelStaleAntigravityProbes("")
+	r.WaitAntigravityProbes()
 	if r.coreManager != nil {
 		r.coreManager.Shutdown()
 	}
@@ -528,17 +572,33 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 
 // PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
 func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
+	persisted, _, errPersist := r.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
+	return persisted, errPersist
+}
+
+// PersistClusterUsagePayloadOutcome stores a cluster usage payload with its trusted receive time
+// and reports whether the payload was newly inserted (false when deduplicated).
+func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, bool, error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
-		return false, nil
+		return false, false, nil
 	}
-	queue := r.getClusterUsageQueue()
-	if queue == nil {
-		return true, nil
+	if outcomeStore, ok := r.clusterAdapter.(clusterUsageOutcomeStore); ok && outcomeStore != nil {
+		inserted, errStore := outcomeStore.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
+		if errStore != nil {
+			return false, false, errStore
+		}
+		return true, inserted, nil
 	}
-	if ok := queue.Push(payload, receivedAt); !ok {
-		log.Warnf("cluster usage queue is stopped; accepting usage without persistence")
+	store, ok := r.clusterAdapter.(clusterUsageStore)
+	if !ok || store == nil {
+		return false, false, fmt.Errorf("cluster usage store is unavailable")
 	}
-	return true, nil
+	// Acknowledge usage only after its database transaction commits. A failed
+	// write must reach the sender, not disappear from an in-memory queue.
+	if errStore := store.StoreUsagePayload(ctx, payload, receivedAt); errStore != nil {
+		return false, false, errStore
+	}
+	return true, true, nil
 }
 
 // PersistAppLogPayload stores a CPA app log payload in the runtime database.
@@ -668,39 +728,6 @@ func (r *Runtime) ListPendingPluginTasks(ctx context.Context, nodeType string, n
 		return nil, fmt.Errorf("plugin task store unavailable")
 	}
 	return store.ListPendingPluginTasks(ctx, nodeType, nodeID)
-}
-
-func (r *Runtime) startKVCleanupLoop(ctx context.Context) {
-	store, errStore := r.kvStore()
-	if errStore != nil {
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	go r.runKVCleanupLoop(ctx, store)
-}
-
-func (r *Runtime) runKVCleanupLoop(ctx context.Context, store kvStore) {
-	if store == nil {
-		return
-	}
-	purge := func() {
-		if _, errPurge := store.KVPurgeExpired(ctx, time.Now().UTC(), 1000); errPurge != nil {
-			log.Errorf("kv store purge error: %v", errPurge)
-		}
-	}
-	purge()
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			purge()
-		}
-	}
 }
 
 // BuildRefreshPayload builds a build refresh payload.
@@ -893,7 +920,7 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey, reqModel)
 	if errAllowed != nil {
-		return nil, errAllowed
+		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
 	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
 	if pinnedAuthID != "" {
@@ -928,7 +955,8 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
 	}
-	return r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	result, errDispatch := r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	return result, r.withModelAliasHint(ctx, errDispatch, reqModel, apiKey)
 }
 
 func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
@@ -963,8 +991,20 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
+	// Database-backed admissions commit the binding and the concurrency counter
+	// in one transaction. Standalone dispatch without a limiter can CAS directly.
+	// Legacy custom admitters without a shared store retain selector-side commits.
+	if r.concurrencyAdmitter == nil || r.sessionAffinityStore != nil {
+		opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
+	}
 	var lastCandidateError error
 	for {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
+		}
+		if opts.SessionAffinity != nil {
+			*opts.SessionAffinity = coreauth.SessionAffinitySelection{}
+		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
 			if lastCandidateError != nil {
@@ -1008,12 +1048,32 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			result.UnaccountedReply = unaccounted
 			result.AccountedReply = accounted
 		}
+		var binding *coreauth.SessionAffinityCommit
+		if opts.SessionAffinity != nil {
+			binding = opts.SessionAffinity.Commit
+		}
+		// Explicitly installed local/custom selectors cannot participate in the
+		// database admission transaction. Keep their selector-side CAS behavior.
+		if binding != nil && r.concurrencyAdmitter != nil && opts.SessionAffinity.Store != r.sessionAffinityStore {
+			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
+			if errSwap != nil {
+				return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
+			}
+			if !swapped {
+				continue
+			}
+			binding = nil
+		}
 		if r.concurrencyAdmitter != nil {
 			admission, errAdmit := r.concurrencyAdmitter.AdmitCredentialConcurrency(ctx, ConcurrencyAdmissionRequest{
 				CredentialID: auth.ID, Model: concurrencyModel, Fingerprint: concurrencyCtx.Fingerprint,
 				ConnectedAt: concurrencyCtx.ConnectedAt, Controlled: concurrencyCtx.Controlled, ProtocolVersion: concurrencyCtx.ProtocolVersion,
+				SessionAffinity: binding,
 			})
 			if errAdmit != nil {
+				if errors.Is(errAdmit, coreauth.ErrSessionAffinityConflict) {
+					continue
+				}
 				admissionType := concurrencyAdmissionErrorType(errAdmit)
 				if !concurrencyCandidateIneligible(admissionType) {
 					return nil, errAdmit
@@ -1039,6 +1099,14 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				return result, nil
 			}
 			result.Concurrency = admission
+		} else if binding != nil {
+			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
+			if errSwap != nil {
+				return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
+			}
+			if !swapped {
+				continue
+			}
 		}
 		return result, nil
 	}
@@ -1068,6 +1136,28 @@ func concurrencyExcludedCandidates(opts coreauth.Options) []coreauth.ExcludedCon
 	}
 	candidates, _ := opts.Metadata[coreauth.ExcludedConcurrencyCandidatesMetadataKey].([]coreauth.ExcludedConcurrencyCandidate)
 	return candidates
+}
+
+// ModelAccessForAPIKey resolves listing permissions without selecting credentials.
+func (r *Runtime) ModelAccessForAPIKey(ctx context.Context, apiKey string) (*coreauth.ModelAccess, error) {
+	if r == nil {
+		return nil, fmt.Errorf("home runtime: runtime is nil")
+	}
+	if r.clusterAdapter == nil {
+		return nil, nil
+	}
+	store, ok := r.clusterAdapter.(apiKeyModelAccessStore)
+	if !ok || store == nil {
+		return nil, fmt.Errorf("home runtime: model access policy unavailable")
+	}
+	policy, errPolicy := store.ModelAccessForAPIKey(ctx, strings.TrimSpace(apiKey))
+	if errPolicy != nil {
+		return nil, errPolicy
+	}
+	if policy == nil {
+		return nil, fmt.Errorf("home runtime: model access policy unavailable")
+	}
+	return policy, nil
 }
 
 func (r *Runtime) allowedAuthIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
@@ -1108,6 +1198,44 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 		allowedModelIDs = modelIDs
 	}
 	return allowedAuthIDs, allowedModelIDs, nil
+}
+
+// withModelAliasHint preserves the original lookup error and adds only aliases
+// visible to this API key. Policy failures omit the optional hint.
+func (r *Runtime) withModelAliasHint(ctx context.Context, err error, reqModel, apiKey string) error {
+	if err == nil || r == nil || r.coreManager == nil {
+		return err
+	}
+	authErr, structured := err.(*coreauth.Error)
+	code := ""
+	if structured {
+		if authErr == nil || authErr.Upstream != nil {
+			return err
+		}
+		code = authErr.Code
+	} else {
+		code, _ = homeerrors.SplitRedisErrorMessage(err.Error())
+	}
+	if code != homeerrors.TypeAuthNotFound && code != homeerrors.TypeModelNotFound {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	policy, errPolicy := r.ModelAccessForAPIKey(ctx, apiKey)
+	if errPolicy != nil {
+		return err
+	}
+	hint := coreauth.ModelAliasHint(reqModel, r.coreManager.AliasesForUpstreamModel(reqModel, policy))
+	if hint == "" {
+		return err
+	}
+	if !structured {
+		return fmt.Errorf("%w; %s", err, hint)
+	}
+	annotated := *authErr
+	annotated.Message = strings.TrimSpace(annotated.Message) + "; " + hint
+	return &annotated
 }
 
 // supportsRequestedModel handles a supports requested model.
@@ -1165,56 +1293,36 @@ func (r *Runtime) AddToken(ctx context.Context, rawJSON string) (string, error) 
 	baseName := strings.ToLower(tokenType) + "-" + token + ".json"
 	fullPath := filepath.Join(authDir, baseName)
 
-	if errMk := os.MkdirAll(authDir, 0o755); errMk != nil {
-		return "", fmt.Errorf("home runtime: create auth dir: %w", errMk)
-	}
-
-	if _, errStat := os.Stat(fullPath); errStat == nil {
-		r.applyAuthFile(ctx, fullPath, []byte(rawJSON))
-		return baseName, nil
-	} else if !os.IsNotExist(errStat) {
-		return "", fmt.Errorf("home runtime: stat auth file: %w", errStat)
-	}
-
-	if errWrite := os.WriteFile(fullPath, []byte(rawJSON), 0o600); errWrite != nil {
-		return "", fmt.Errorf("home runtime: write auth file: %w", errWrite)
-	}
-
-	r.applyAuthFile(ctx, fullPath, []byte(rawJSON))
-	return baseName, nil
-}
-
-// applyAuthFile applies an auth file.
-func (r *Runtime) applyAuthFile(ctx context.Context, fullPath string, data []byte) {
-	// Normalize auth state before updating runtime indexes.
-	if r == nil || r.coreManager == nil {
-		return
-	}
-	r.cfgMu.RLock()
-	cfg := r.cfg
-	authDir := r.authDir
-	r.cfgMu.RUnlock()
-	if cfg == nil {
-		return
-	}
-
-	sctx := &synthesizer.SynthesisContext{
+	// Synthesize before touching the auth dir so an invalid payload never leaves a file behind.
+	auths, errSynthesize := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
 		Config:           cfg,
 		AuthDir:          authDir,
 		Now:              time.Now(),
 		IDGenerator:      synthesizer.NewStableIDGenerator(),
 		PluginAuthParser: r,
+	}, fullPath, []byte(rawJSON))
+	if errSynthesize != nil {
+		return "", fmt.Errorf("home runtime: parse token json: %w", errSynthesize)
 	}
 
-	auths := synthesizer.SynthesizeAuthFile(sctx, fullPath, data)
-	if len(auths) == 0 {
-		return
+	if errMk := os.MkdirAll(authDir, 0o755); errMk != nil {
+		return "", fmt.Errorf("home runtime: create auth dir: %w", errMk)
+	}
+
+	if _, errStat := os.Stat(fullPath); errStat != nil {
+		if !os.IsNotExist(errStat) {
+			return "", fmt.Errorf("home runtime: stat auth file: %w", errStat)
+		}
+		if errWrite := os.WriteFile(fullPath, []byte(rawJSON), 0o600); errWrite != nil {
+			return "", fmt.Errorf("home runtime: write auth file: %w", errWrite)
+		}
 	}
 
 	ctxSkipPersist := coreauth.WithSkipPersist(ctx)
-	for _, a := range auths {
-		r.applyCoreAuthAddOrUpdate(ctxSkipPersist, a)
+	for _, auth := range auths {
+		r.applyCoreAuthAddOrUpdate(ctxSkipPersist, auth)
 	}
+	return baseName, nil
 }
 
 func (r *Runtime) refreshAccessProviders() {
